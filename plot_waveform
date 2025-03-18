@@ -1,0 +1,437 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+log() {
+    echo "$(date +%T) $(basename "${0}"): ${1:-log() argument missing}"
+}
+log_err() {
+    log "${1:-log_err() argument missing}" >&2
+}
+die() {
+    log_err "${1-die() argument missing}"
+    exit 1
+}
+die_usage() {
+    log_err "${1-die() argument missing}"
+    usage
+    exit 1
+}
+usage() {
+    cat << EOF
+Usage:
+  $(basename "${0}") -i FILE [optional arguments]
+
+  Required:
+    -i | --input FILE       - input audio file
+
+  Optional:
+    -o | --output FILE      - output file (default is same as input with the
+                              extensions changed to "png")
+    -F | --force            - force overwrite output file
+
+    -t | --title TITLE      - title (default is "artist / album / title" or
+                              the filename if metadata is not available)
+    -s | --size SIZE        - size (default is 1000x500)
+
+    -S | --start SECONDS    - start position in seconds with fractions
+                              (default: 0)
+    -d | --duration SECONDS - duration in seconds with fractions
+                              (default: input file duration)
+
+    -h | --help             - this help message
+
+The script uses FFmpeg and ImageMagick to crate a waveform image looking similar
+to Audacity view.
+
+FFmpeg >= 4.4 is required for the script to work correctly.
+EOF
+}
+
+declare -ra required_cmds=(cp mv ls ffmpeg ffprobe convert)
+for cmd in "${required_cmds[@]}"; do
+    if ! which "${cmd}" >/dev/null 2>&1; then
+        log "Required tools: ${required_cmds[*]}"
+        die "Required tool not found: ${cmd}"
+    fi
+done
+
+input_file=""
+output_file=""
+force_overwrite="no"
+title=""
+size="1000x500"
+audio_start_s=0
+audio_duration_s=""
+while [ -n "${1-}" ]; do
+    case "${1}" in
+        -i|--input| \
+        -o|--output| \
+        -t|--title| \
+        -s|--size| \
+        -S|--start| \
+        -d|--duration)
+            if [ ! $# -ge 2 ]; then
+                die_usage "Argument missing for option ${1}"
+            fi
+        ;;
+    esac
+    case "${1}" in
+        -i|--input)
+            input_file="${2}"
+            shift
+        ;;
+        -o|--output)
+            output_file="${2}"
+            shift
+        ;;
+        -F|--force)
+            force_overwrite="yes"
+        ;;
+        -t|--title)
+            title="${2}"
+            shift
+        ;;
+        -s|--size)
+            size="${2}"
+            shift
+        ;;
+        -S|--start)
+            audio_start_s="${2}"
+            shift
+        ;;
+        -d|--duration)
+            audio_duration_s="${2}"
+            shift
+        ;;
+        -h|--help)
+            usage
+            exit 0
+        ;;
+        *)
+            break
+        ;;
+    esac
+    shift
+done
+
+if [ -z "${input_file}" ]; then
+    die_usage "Input file is required."
+fi
+if [ ! -f "${input_file}" ]; then
+    die "File ${input_file} doesn't exist."
+fi
+if [ -z "${output_file}" ]; then
+    output_file="${input_file%.*}.png"
+fi
+if [ -f "${output_file}" ] && [ "${force_overwrite}" != "yes" ]; then
+    die "File ${output_file} already exists. Use -F | --force to overwrite."
+fi
+
+size_regex="^[0-9]+x[0-9]+$"
+if [[ "${size}" =~ ${size_regex} ]]; then
+    width="$(echo "${size}" | cut -d'x' -f1)"
+    height="$(echo "${size}" | cut -d'x' -f2)"
+else
+    die_usage "Wrong format for --size: ${size}"
+fi
+seconds_regex="^([0-9]+\.?[0-9]*)|(\.[0-9]+)$"
+if ! [[ "${audio_start_s}" =~ ${seconds_regex} ]]; then
+    die_usage "Wrong format for --start: ${audio_start_s}"
+fi
+if [ -n "${audio_duration_s}" ] && ! [[ "${audio_duration_s}" =~ ${seconds_regex} ]]; then
+    die_usage "Wrong format for --duration: ${audio_duration_s}"
+fi
+
+
+
+tmp_dir=$(mktemp -d)
+trap 'rm -rf "${tmp_dir}"' EXIT
+
+bcdo() {
+    echo "${1}" | bc -l
+}
+
+msec_to_time() {
+    local total_ms="${1}"
+    local is_show_ms="${2}"
+
+    local total_s=$(( total_ms / 1000 ))
+    local h=$(( total_s / 3600 ))
+    local m=$(( (total_s - h*3600) / 60 ))
+    local s=$(( total_s - h*3600 - m*60 ))
+
+    if (( h == 0 )); then
+        if (( m == 0 )); then
+            printf "%d" ${s}
+        else
+            printf "%d:%02d" ${m} ${s}
+        fi
+    else
+        printf "%d:%02d:%02d" ${h} ${m} ${s}
+    fi
+
+    if (( is_show_ms )); then
+        local ms; ms=$(bcdo "scale=3; (${total_ms} - ${total_s}*1000) / 1000") # this returns either "0" or ".xyz"
+        if [ "${ms}" = "0" ]; then
+            printf ".0\n"
+        else
+            ms="${ms%0}"
+            ms="${ms%0}"
+            printf "%s\n" "${ms}"
+        fi
+    else
+        printf "\n"
+    fi
+}
+
+declare -r format_file="${tmp_dir}/format.txt"
+ffprobe -select_streams a -show_entries stream=channels,codec_name,sample_rate,bits_per_sample,bits_per_raw_sample,duration,duration_ts -of default -v 0 "${input_file}" | grep -F "=" >"${format_file}"
+     codec_name="$(grep -F "codec_name="          "${format_file}" | cut -d'=' -f2)"
+    sample_rate="$(grep -F "sample_rate="         "${format_file}" | cut -d'=' -f2)"
+     bit_depth1="$(grep -F "bits_per_sample="     "${format_file}" | cut -d'=' -f2)"
+     bit_depth2="$(grep -F "bits_per_raw_sample=" "${format_file}" | cut -d'=' -f2)"
+       channels="$(grep -F "channels="            "${format_file}" | cut -d'=' -f2)"
+file_duration_s="$(grep -F "duration="            "${format_file}" | cut -d'=' -f2)"
+   file_samples="$(grep -F "duration_ts="         "${format_file}" | cut -d'=' -f2)"
+
+bit_depth="${bit_depth1}"
+if [[ "${bit_depth2}" =~ ^[1-9][0-9]*$ ]]; then
+    bit_depth="${bit_depth2}"
+fi
+
+if [ -z "${audio_duration_s}" ]; then
+    audio_duration_s=$(bcdo "${file_duration_s} - ${audio_start_s}")
+fi
+
+if [ "$(bcdo "${audio_start_s} >= ${file_duration_s}")" = "1" ]; then
+    die "--start must be less than the file duration, which is ${file_duration_s}"
+fi
+max_audio_duration_s=$(bcdo "${file_duration_s} - ${audio_start_s}")
+if [ -z "${audio_duration_s}" ]; then
+    audio_duration_s="${max_audio_duration_s}"
+elif [ "$(bcdo "${audio_duration_s} > ${max_audio_duration_s}")" = "1" ]; then
+    log "Overriding --duration with max allowed: ${max_audio_duration_s}"
+    audio_duration_s="${max_audio_duration_s}"
+fi
+
+
+
+log "File is ${bit_depth}/${sample_rate} ${channels}-ch ${codec_name}"
+log "File duration: ${file_duration_s}s, ${file_samples} samples"
+
+declare -i audio_duration_ms=$(bcdo "x=1000 * ${audio_duration_s}; scale=0; x/1")
+declare -i audio_duration_samples=$(bcdo "x=${audio_duration_s} * ${sample_rate}; scale=0; x/1")
+declare -i audio_start_samples=$(bcdo "x=${audio_start_s} * ${sample_rate}; scale=0; x/1")
+
+log "audio_start_samples=${audio_start_samples}, end=$((audio_start_samples + audio_duration_samples)), duration=${audio_duration_samples}"
+
+
+
+declare -r metadata_file="${tmp_dir}/metadata.txt"
+read_metadata() {
+    local tag="${1}"
+    grep -i "^${tag}=" "${metadata_file}" | cut -d'=' -f2- || true
+}
+if [ -z "${title}" ]; then
+    ffmpeg -loglevel error -y -i "${input_file}" -f ffmetadata "${metadata_file}"
+    title="$(read_metadata "title")"
+    if [ -z "${title}" ]; then
+        title="${input_file##*/}"
+    else
+        track="$(read_metadata "track")"
+        if [ -n "${track}" ]; then
+            title="${track}. ${title}"
+            disc="$(read_metadata "disc")"
+            totaldiscs="$(read_metadata "totaldiscs")"
+            if [ -n "${disc}" ] && [ "${totaldiscs}" != "1" ]; then
+                title="${disc}-${title}"
+            fi
+        fi
+        album="$(read_metadata "album")"
+        artist="$(read_metadata "artist")"
+
+        title="${artist:-<unset>} / ${album:-<unset>} / ${title}"
+    fi
+    log "Title will be: ${title}"
+fi
+
+
+
+# We want tics to be about 100px apart:
+declare -i tic_len_px=100
+# Based on the width, this gives us about this number of tics:
+declare -i num_of_tics=$(( width / tic_len_px ))
+# and the tic duration:
+declare -i tic_duration_ms=$(( audio_duration_ms / num_of_tics ))
+declare -i num_of_mtics=2
+
+# Round up the tic duration to some "nice" value:
+log "initial tic_duration_ms=${tic_duration_ms}"
+if (( tic_duration_ms < 10 )); then # 0.01 sec
+    tic_duration_ms=10
+    num_of_mtics=2
+elif (( tic_duration_ms < 50 )); then # 0.05 sec
+    tic_duration_ms=50
+    num_of_mtics=5
+elif (( tic_duration_ms < 100 )); then # 0.1 sec
+    tic_duration_ms=100
+    num_of_mtics=2
+elif (( tic_duration_ms < 500 )); then # 0.5 sec
+    tic_duration_ms=500
+    num_of_mtics=5
+elif (( tic_duration_ms < 1000 )); then # 1 sec
+    tic_duration_ms=1000
+    num_of_mtics=2
+elif (( tic_duration_ms < 5000 )); then # 5 sec
+    tic_duration_ms=5000
+    num_of_mtics=5
+elif (( tic_duration_ms < 15000 )); then # 15 sec
+    tic_duration_ms=15000
+    num_of_mtics=3
+elif (( tic_duration_ms < 30000 )); then # 30 sec
+    tic_duration_ms=30000
+    num_of_mtics=3
+elif (( tic_duration_ms < 60000 )); then # 1 min
+    tic_duration_ms=60000
+    num_of_mtics=2
+elif (( tic_duration_ms < 300000 )); then # 5 min
+    tic_duration_ms=300000
+    num_of_mtics=5
+else # 15 min
+    tic_duration_ms=900000
+    num_of_mtics=3
+fi
+
+declare -i tic_duration_samples=$(( sample_rate * tic_duration_ms / 1000 ))
+get_tic_pos_px() {
+    local tic_num=${1}
+    echo $(( width * tic_num * tic_duration_samples / audio_duration_samples ))
+}
+
+tic_len_px=$(get_tic_pos_px 1)
+num_of_tics=$(( width / tic_len_px ))
+declare -i mtic_len_px=$(( tic_len_px / num_of_mtics ))
+log "num_of_tics=${num_of_tics} tic_len_px=${tic_len_px} tic_duration_ms=${tic_duration_ms} num_of_mtics=${num_of_mtics} mtic_len_px=${mtic_len_px}"
+
+# Find if there are tics with same full second mark and if so, set flag to print fraction seconds
+declare -i prev_time_pos_s=-1
+declare -i is_show_ms=0
+for ((t = 1; t <= num_of_tics; t++)); do
+    time_pos_ms=$(( (audio_start_samples + t * tic_duration_samples) * 1000 / sample_rate ))
+    time_pos_s=$(( time_pos_ms / 1000 ))
+    if (( time_pos_s == prev_time_pos_s )); then
+        is_show_ms=1    # we have duplicate "seconds" value, so we need to show ms part too
+        break
+    fi
+    prev_time_pos_s=${time_pos_s}
+done
+
+# Generate ImageMagick commands to draw the tics and the labels
+width_half=$(( width / 2 ))
+draw_tics=()
+annotate=()
+declare -i tic_pos_px
+log "Tics at:"
+for ((t = 1; t <= num_of_tics; t++)); do
+    tic_pos_px=$(get_tic_pos_px ${t})
+    tic_pos_px=$(( tic_pos_px - 1 ))
+
+    draw_one=()
+    for (( m = num_of_mtics - 1; m >= 1; m-- )); do
+        mtic_pos_px=$(( tic_pos_px - m * mtic_len_px ))
+        draw_one+=("line ${mtic_pos_px},20 ${mtic_pos_px},24")
+    done
+    draw_one+=("translate ${tic_pos_px},20 circle 0,0 2,0")
+    draw_tics+=("-draw" "${draw_one[*]}")
+
+    annotate_pos_px=$(( tic_pos_px - width_half ))
+    time_pos_ms=$(( (audio_start_samples + t * tic_duration_samples) * 1000 / sample_rate ))
+    annotate+=("-annotate" "+${annotate_pos_px}+5" "$(msec_to_time ${time_pos_ms}  ${is_show_ms})")
+    echo "$t - $(msec_to_time ${time_pos_ms} ${is_show_ms})"
+done
+
+# ... mtics after the last tic
+    tic_pos_px=$((t * tic_len_px - 1))
+    draw_one=()
+    for (( m = num_of_mtics - 1; m >= 1; m-- )); do
+        mtic_pos_px=$(( tic_pos_px - m * mtic_len_px ))
+        draw_one+=("line ${mtic_pos_px},20 ${mtic_pos_px},24")
+    done
+    draw_tics+=("-draw" "${draw_one[*]}")
+
+titlebar_bg_col='#cdcdff'
+timebar_bg_col='#f7f9ff'
+bg_col='#c0c0c0'
+peak_col='#3232c8'
+rms_col='#6464dc'
+
+convert -size "${width}x25" xc:"${titlebar_bg_col}" -font "Noto-Sans-Regular" -pointsize 14 \
+    -fill black -draw "line 0,24 ${width},24" \
+    -gravity southwest -annotate +5+5 "${title}" \
+    "${tmp_dir}/titlebar.png"
+
+convert -size "${width}x25" xc:"${timebar_bg_col}" -font "Noto-Sans-Regular" -pointsize 14 \
+    -fill black -draw "line 0,24 ${width},24" \
+    "${draw_tics[@]}" \
+    -gravity south "${annotate[@]}" \
+    "${tmp_dir}/timebar.png"
+
+# Generate ImageMagick to draw the background with:
+# - -inf dBFS line (same color as peaks)
+# - -6 and -12 dBFS lines (light gray)
+# - a separating line in stereo (thicker)
+magick_args=()
+if (( channels == 1 )); then
+    magick_args+=(
+        -fill "${peak_col}" -draw " \
+        stroke-dasharray 5 5 line 0,$((  1 * height /  2 )) ${width},$((  1 * height /  2 )) \
+        "
+        -fill '#808080' -draw " \
+        line 0,$((  1 * height /  4 )) ${width},$((  1 * height /  4 )) \
+        line 0,$((  3 * height /  4 )) ${width},$((  3 * height /  4 )) \
+        line 0,$((  3 * height /  8 )) ${width},$((  3 * height /  8 )) \
+        line 0,$((  5 * height /  8 )) ${width},$((  5 * height /  8 )) \
+        "
+    )
+elif (( channels == 2 )); then
+    magick_args+=(
+        -fill "${peak_col}" -draw " \
+        line 0,$((  1 * height /  4 )) ${width},$((  1 * height /  4 )) \
+        line 0,$((  3 * height /  4 )) ${width},$((  3 * height /  4 )) \
+        "
+        -fill '#808080' -draw " \
+        line 0,$((  1 * height /  8 )) ${width},$((  1 * height /  8 )) \
+        line 0,$((  3 * height /  8 )) ${width},$((  3 * height /  8 )) \
+        line 0,$((  5 * height /  8 )) ${width},$((  5 * height /  8 )) \
+        line 0,$((  7 * height /  8 )) ${width},$((  7 * height /  8 )) \
+        line 0,$((  3 * height / 16 )) ${width},$((  3 * height / 16 )) \
+        line 0,$((  5 * height / 16 )) ${width},$((  5 * height / 16 )) \
+        line 0,$(( 11 * height / 16 )) ${width},$(( 11 * height / 16 )) \
+        line 0,$(( 13 * height / 16 )) ${width},$(( 13 * height / 16 )) \
+        "
+        -strokewidth 2 -stroke '#404040' -draw "line 0,$(( height / 2 )) ${width},$(( height / 2 ))"
+    )
+fi
+
+convert -size "${size}" xc:"${bg_col}" \
+    "${magick_args[@]}" \
+    "${tmp_dir}/bg.png"
+
+ffmpeg -hide_banner -nostats -loglevel warning -y \
+    -i "${input_file}" \
+    -filter_complex " \
+    [0:a] atrim=start_sample=${audio_start_samples}:end_sample=$((audio_start_samples + audio_duration_samples)) [t]; \
+    [t] asplit [a1][a2]; \
+    [a1] showwavespic=s=${size}:split_channels=1:draw=full:colors=${peak_col}:filter=peak [pk]; \
+    [a2] showwavespic=s=${size}:split_channels=1:draw=full:colors=${rms_col} [rms]; \
+    [pk] [rms] overlay=format=auto" \
+    -frames:v 1 -update true "${tmp_dir}/waveform.png"
+
+# Merge all together
+convert \
+    "${tmp_dir}/titlebar.png" \
+    "${tmp_dir}/timebar.png" \
+    \( "${tmp_dir}/bg.png" "${tmp_dir}/waveform.png" -flatten \) \
+    -append -quality 95 "${output_file}"
+
+log "THE END"
